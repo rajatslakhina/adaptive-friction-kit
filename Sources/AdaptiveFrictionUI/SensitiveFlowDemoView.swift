@@ -95,6 +95,10 @@ public struct SensitiveFlowDemoView: View {
                 ForEach(QAScenario.Availability.allCases, id: \.self) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
+            Button("Forget remembered unavailability") {
+                Task { await model.forgetUnavailability() }
+            }
+            .disabled(model.rememberedUnavailability == "none")
             Toggle("Prior model present (shadow)", isOn: $model.priorPresent)
             if model.priorPresent {
                 Picker("Prior model says", selection: $model.priorSignal) {
@@ -155,7 +159,8 @@ public struct SensitiveFlowDemoView: View {
             LabeledContent("Shadow comparisons", value: "\(model.shadowLedger.comparisons)")
             LabeledContent("· agree / escalate / relax",
                            value: "\(model.shadowLedger.agreements) / \(model.shadowLedger.escalations) / \(model.shadowLedger.relaxations)")
-            LabeledContent("· prior unavailable", value: "\(model.shadowLedger.observerUnavailable)")
+            LabeledContent("· observer / driver unavailable",
+                           value: "\(model.shadowLedger.observerUnavailable) / \(model.shadowLedger.driverUnavailable)")
             LabeledContent("Promotion verdict", value: model.verdictText)
         } header: {
             Text("Ledgers")
@@ -302,6 +307,8 @@ final class FlowModel: ObservableObject {
         switch shadowLedger.verdict(shadow) {
         case .insufficientSamples(let have, let need):
             return "insufficient (\(have)/\(need))"
+        case .observerTooOftenMissing(let rate, let limit):
+            return String(format: "blocked: observer missing %.0f%% (limit %.0f%%)", rate * 100, limit * 100)
         case .promotable(let interval):
             return String(format: "promotable (≤ %.1f%%)", interval.upper * 100)
         case .blocked(let interval):
@@ -329,6 +336,12 @@ final class FlowModel: ObservableObject {
         let remembered = await policy.rememberedUnavailability
         rememberedUnavailability = remembered.map { describe($0) } ?? "none"
         audit = await auditSink.snapshot()
+    }
+
+    func forgetUnavailability() async {
+        await policy.forgetUnavailability()
+        let remembered = await policy.rememberedUnavailability
+        rememberedUnavailability = remembered.map { describe($0) } ?? "none"
     }
 
     func describe(_ basis: DecisionBasis) -> String {

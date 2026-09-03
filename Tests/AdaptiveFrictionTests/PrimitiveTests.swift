@@ -223,7 +223,35 @@ final class ShadowLedgerTests: XCTestCase {
         XCTAssertGreaterThan(interval.upper, 0.11)
     }
 
+    /// A model that agrees perfectly when present but is missing too often
+    /// is blocked *before* agreement is examined. Remove the absence gate in
+    /// `verdict(_:)` and this returns `promotable`.
+    func testAnObserverThatIsMissingTooOftenIsNotPromotableHoweverWellItAgrees() throws {
+        let configuration = try ShadowConfiguration(driver: .prior, observer: .current,
+                                                    disagreementTolerance: 0.05, maximumObserverAbsence: 0.10)
+        var ledger = ShadowLedger()
+        let agree = ShadowComparison(band: .low, driverSignal: .unknown, observerSignal: .unknown,
+                                     driverLevel: .proceed, observerLevel: .proceed)
+        for _ in 0..<80 { ledger.record(agree) }
+        for _ in 0..<20 { ledger.recordObserverUnavailable() }   // absent 20% of the time
+        guard case .observerTooOftenMissing(let rate, let limit) = ledger.verdict(configuration) else {
+            return XCTFail("expected observerTooOftenMissing, got \(ledger.verdict(configuration))")
+        }
+        XCTAssertEqual(rate, 0.2, accuracy: 1e-12)
+        XCTAssertEqual(limit, 0.10)
+        // Driver absences are not the observer's fault and do not count.
+        var other = ShadowLedger()
+        for _ in 0..<80 { other.record(agree) }
+        for _ in 0..<20 { other.recordDriverUnavailable() }
+        guard case .promotable = other.verdict(configuration) else {
+            return XCTFail("driver absences must not block promotion")
+        }
+        XCTAssertNil(ShadowLedger().observerAbsenceRate)
+    }
+
     func testConfigurationValidation() {
+        XCTAssertThrowsError(try ShadowConfiguration(driver: .current, observer: .prior, maximumObserverAbsence: 1.5))
+        XCTAssertThrowsError(try ShadowConfiguration(driver: .current, observer: .prior, maximumObserverAbsence: -0.1))
         XCTAssertThrowsError(try ShadowConfiguration(driver: .current, observer: .current))
         XCTAssertThrowsError(try ShadowConfiguration(driver: .current, observer: .prior, disagreementTolerance: 0))
         XCTAssertThrowsError(try ShadowConfiguration(driver: .current, observer: .prior, disagreementTolerance: 1.5))

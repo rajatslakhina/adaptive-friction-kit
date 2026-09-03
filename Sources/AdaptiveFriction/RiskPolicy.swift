@@ -236,8 +236,13 @@ public actor RiskPolicy {
                                        driverLevel: priorLevel, observerLevel: currentLevel)
                 shadowLedger.record(observed)
                 comparison = observed
-            } else {
+            } else if shadow.observer == .prior {
                 shadowLedger.recordObserverUnavailable()
+            } else {
+                // The prior model was the *driver* and is missing; the current
+                // model drove instead (see above). That says nothing about the
+                // observer, which was present.
+                shadowLedger.recordDriverUnavailable()
             }
         }
 
@@ -275,8 +280,25 @@ public actor RiskPolicy {
     }
 
     private func deliver(_ report: ConsumptionReport) async {
-        ledger.settle(report.outcome)
+        // The source hears first; the ledger settles second. `drainReports`
+        // waits on the ledger, so when it returns the source has been told.
         await source.reportConsumption(report)
+        ledger.settle(report.outcome)
+    }
+
+    /// Test seam: creates an obligation wired to this policy's ledger and
+    /// source exactly as `decide` wires them (reservation included) and then
+    /// drops it without reporting — the one thing `decide` never does. The
+    /// drop must show up as `ledger.discardedUnreported == 1` and as a
+    /// `.discardedUnreported` report at the source; that is the test which
+    /// proves the safety net is *connected*, not merely that
+    /// `InsightEvaluation.deinit` runs. Noncopyable values cannot leave the
+    /// actor, which is why the drop happens here rather than in the test.
+    func dropObligationForTesting(id: EvaluationID) {
+        ledger.reserve()
+        _ = InsightEvaluation(id: id, reporter: { [weak self] report in
+            self?.enqueueReport(report)
+        })
     }
 
     /// Waits for every report that has been enqueued so far to reach the

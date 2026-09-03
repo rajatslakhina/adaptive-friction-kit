@@ -33,12 +33,15 @@ final class RiskPolicyTests: XCTestCase {
         XCTAssertGreaterThan(elevated.level, elevated.floor)
     }
 
-    /// Property over the whole space: the signal never lowers friction.
-    func testSignalNeverLowersFrictionBelowTheFloor() async throws {
+    /// Property over the whole (band × signal) space: the decision is exactly
+    /// the matrix cell, and therefore never below the floor. Equality, not
+    /// `>=`, so a fusion gutted to "return the floor" fails on six cells.
+    func testEveryBandSignalPairDecidesExactlyTheMatrixCell() async throws {
         for signal in CoachingSignal.allCases {
             let (policy, _) = try Fixtures.policy(SimulatedBehaviour(signal: signal))
             for band in RiskBand.allCases {
                 let decision = await policy.decide(Fixtures.operation(band: band))
+                XCTAssertEqual(decision.level, FrictionMatrix.standard.level(band: band, signal: signal), "\(signal)/\(band)")
                 XCTAssertGreaterThanOrEqual(decision.level, decision.floor, "\(signal)/\(band)")
             }
         }
@@ -152,6 +155,51 @@ final class RiskPolicyTests: XCTestCase {
         XCTAssertTrue(reports.contains { $0.outcome == .appliedFriction(.holdForReview) })
     }
 
+    /// Positive control for the safety net: an obligation wired exactly as
+    /// `decide` wires it, then dropped. The ledger must count it *and* the
+    /// source must hear `.discardedUnreported`. Delete the increment in
+    /// `ConsumptionLedger.settle` or the reporter wiring and this fails.
+    func testADroppedObligationReachesTheLedgerAndTheSource() async throws {
+        let (policy, source) = try Fixtures.policy(SimulatedBehaviour(signal: .medium))
+        await policy.dropObligationForTesting(id: EvaluationID("dropped-1"))
+        await policy.drainReports()
+        let ledger = await policy.ledger
+        let reports = await source.reports
+        XCTAssertEqual(ledger.discardedUnreported, 1)
+        XCTAssertEqual(ledger.reported, 1)
+        XCTAssertEqual(ledger.outstanding, 0)
+        XCTAssertEqual(reports, [ConsumptionReport(id: EvaluationID("dropped-1"), outcome: .discardedUnreported)])
+    }
+
+    /// Positive control for `unreportedIDs`: bypass the policy, evaluate
+    /// directly, and the source must show the debt until it is paid. A stub
+    /// that always answers `[]` fails here.
+    func testUnreportedIDsShowsTheDebtUntilItIsReported() async throws {
+        let source = SimulatedInsightSource(SimulatedBehaviour(signal: .high, latency: .zero))
+        let first = try await source.evaluate(InsightRequest(category: .payment, versions: [.current]))
+        let second = try await source.evaluate(InsightRequest(category: .account, versions: [.current]))
+        var owed = await source.unreportedIDs
+        XCTAssertEqual(owed, [EvaluationID("sim-1"), EvaluationID("sim-2")])
+        XCTAssertEqual(first.id, EvaluationID("sim-1"))
+        await source.reportConsumption(ConsumptionReport(id: first.id, outcome: .proceeded))
+        owed = await source.unreportedIDs
+        XCTAssertEqual(owed, [second.id])
+        await source.reportConsumption(ConsumptionReport(id: second.id, outcome: .appliedFriction(.holdForReview)))
+        owed = await source.unreportedIDs
+        XCTAssertTrue(owed.isEmpty)
+    }
+
+    func testSimulatedSourceHistoryIsBoundedButDebtIsNot() async throws {
+        let source = SimulatedInsightSource(SimulatedBehaviour(latency: .zero), historyCapacity: 2)
+        for _ in 0..<5 {
+            _ = try await source.evaluate(InsightRequest(category: .other, versions: [.current]))
+        }
+        let requests = await source.requests
+        let owed = await source.unreportedIDs
+        XCTAssertEqual(requests.count, 2, "history is FIFO-bounded")
+        XCTAssertEqual(owed.count, 5, "every unreported evaluation is still owed")
+    }
+
     func testLocalBackpressureRefusesToStartEvaluationsBeyondTheCap() async throws {
         let (policy, source) = try Fixtures.policy(SimulatedBehaviour(signal: .high, latency: .milliseconds(150)),
                                                    maxOutstanding: 2)
@@ -238,8 +286,20 @@ final class RiskPolicyTests: XCTestCase {
         XCTAssertEqual(selector, .current, "the basis must say which model actually drove")
         XCTAssertNil(decision.shadow)
         let ledger = await policy.shadowLedger
-        XCTAssertEqual(ledger.observerUnavailable, 1)
+        XCTAssertEqual(ledger.driverUnavailable, 1, "the missing model was the driver, not the observer")
+        XCTAssertEqual(ledger.observerUnavailable, 0)
         XCTAssertEqual(ledger.comparisons, 0)
+    }
+
+    func testMissingPriorCountsAsObserverUnavailableWhenThePriorIsTheObserver() async throws {
+        let shadow = try ShadowConfiguration(driver: .current, observer: .prior)
+        let (policy, _) = try Fixtures.policy(SimulatedBehaviour(signal: .high, priorSignal: nil), shadow: shadow)
+        let decision = await policy.decide(Fixtures.operation(band: .low))
+        XCTAssertEqual(decision.level, .outOfBandVerify)
+        XCTAssertNil(decision.shadow)
+        let ledger = await policy.shadowLedger
+        XCTAssertEqual(ledger.observerUnavailable, 1)
+        XCTAssertEqual(ledger.driverUnavailable, 0)
     }
 
     func testWithoutShadowOnlyTheCurrentModelIsRequested() async throws {

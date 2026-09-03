@@ -39,12 +39,21 @@ public struct SimulatedBehaviour: Sendable, Hashable {
 /// the exact sequence.
 public actor SimulatedInsightSource: InsightSource {
     public private(set) var behaviour: SimulatedBehaviour
+    /// The newest `historyCapacity` requests, oldest first. Bounded so a
+    /// long-running demo cannot grow without limit; tests never approach it.
     public private(set) var requests: [InsightRequest] = []
+    /// The newest `historyCapacity` reports, oldest first.
     public private(set) var reports: [ConsumptionReport] = []
+    public let historyCapacity: Int
+    /// Evaluations minted but not yet reported. Bounded by the number of
+    /// outstanding evaluations, not by history.
+    private var pending: Set<EvaluationID> = []
     private var nextID = 0
 
-    public init(_ behaviour: SimulatedBehaviour = SimulatedBehaviour()) {
+    /// - Parameter historyCapacity: clamped to at least 1.
+    public init(_ behaviour: SimulatedBehaviour = SimulatedBehaviour(), historyCapacity: Int = 256) {
         self.behaviour = behaviour
+        self.historyCapacity = max(1, historyCapacity)
     }
 
     public func set(_ behaviour: SimulatedBehaviour) {
@@ -53,6 +62,9 @@ public actor SimulatedInsightSource: InsightSource {
 
     public func evaluate(_ request: InsightRequest) async throws -> InsightResponse {
         requests.append(request)
+        if requests.count > historyCapacity {
+            requests.removeFirst(requests.count - historyCapacity)
+        }
         let behaviour = self.behaviour
         if behaviour.latency > .zero {
             // Honour the contract: a cancelled evaluation produces nothing.
@@ -73,23 +85,25 @@ public actor SimulatedInsightSource: InsightSource {
         } else {
             prior = nil
         }
-        return InsightResponse(id: EvaluationID("sim-\(nextID)"),
+        let id = EvaluationID("sim-\(nextID)")
+        pending.insert(id)
+        return InsightResponse(id: id,
                                signal: behaviour.signal,
                                modelVersion: behaviour.currentVersion,
                                prior: prior)
     }
 
     public func reportConsumption(_ report: ConsumptionReport) {
+        pending.remove(report.id)
         reports.append(report)
+        if reports.count > historyCapacity {
+            reports.removeFirst(reports.count - historyCapacity)
+        }
     }
 
     /// Evaluations that returned but have no report yet — the thing the
-    /// platform rate-limits on.
+    /// platform rate-limits on. Sorted for stable assertions.
     public var unreportedIDs: [EvaluationID] {
-        let reported = Set(reports.map(\.id))
-        return (0..<nextID).compactMap { index -> EvaluationID? in
-            let id = EvaluationID("sim-\(index + 1)")
-            return reported.contains(id) ? nil : id
-        }
+        pending.sorted { $0.rawValue < $1.rawValue }
     }
 }

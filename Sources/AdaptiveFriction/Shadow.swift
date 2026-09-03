@@ -13,6 +13,12 @@ public struct ShadowConfiguration: Sendable, Hashable {
     /// Disagreements above this rate (upper bound of the 95% Wilson interval)
     /// block promotion.
     public let disagreementTolerance: Double
+    /// The largest share of evaluations in which the observed model may be
+    /// missing and still be promotable: `observerUnavailable / (comparisons +
+    /// observerUnavailable)`. A model that agrees perfectly when present but
+    /// is absent a third of the time cannot drive decisions a third of the
+    /// time, and the verdict says so before it looks at agreement.
+    public let maximumObserverAbsence: Double
     /// Below this many comparable samples the verdict is `insufficientSamples`.
     ///
     /// Defaults to the smallest sample count at which *zero* disagreements
@@ -25,10 +31,14 @@ public struct ShadowConfiguration: Sendable, Hashable {
     ///   `PolicyError.invalidConfiguration` for a tolerance outside `(0, 1]` or
     ///   a non-positive sample floor.
     public init(driver: ModelSelector, observer: ModelSelector,
-                disagreementTolerance: Double = 0.05, minimumSamples: Int? = nil) throws {
+                disagreementTolerance: Double = 0.05, minimumSamples: Int? = nil,
+                maximumObserverAbsence: Double = 0.10) throws {
         guard driver != observer else { throw PolicyError.shadowSelectorsMustDiffer }
         guard disagreementTolerance.isFinite, disagreementTolerance > 0, disagreementTolerance <= 1 else {
             throw PolicyError.invalidConfiguration("disagreementTolerance must be in (0, 1], got \(disagreementTolerance)")
+        }
+        guard maximumObserverAbsence.isFinite, maximumObserverAbsence >= 0, maximumObserverAbsence <= 1 else {
+            throw PolicyError.invalidConfiguration("maximumObserverAbsence must be in [0, 1], got \(maximumObserverAbsence)")
         }
         let floor = minimumSamples ?? Self.samplesToClear(tolerance: disagreementTolerance)
         guard floor > 0 else {
@@ -38,6 +48,7 @@ public struct ShadowConfiguration: Sendable, Hashable {
         self.observer = observer
         self.disagreementTolerance = disagreementTolerance
         self.minimumSamples = floor
+        self.maximumObserverAbsence = maximumObserverAbsence
     }
 
     /// The smallest `n` for which the Wilson upper bound of `0/n` is within
@@ -72,6 +83,10 @@ public struct ShadowComparison: Sendable, Hashable, Codable {
 
 public enum PromotionVerdict: Sendable, Hashable {
     case insufficientSamples(have: Int, need: Int)
+    /// The observed model was missing too often to be trusted to drive,
+    /// whatever it said when it was present. `rate` is the observed absence
+    /// share; `limit` is the configured maximum.
+    case observerTooOftenMissing(rate: Double, limit: Double)
     /// The observed model can replace the driver: the disagreement rate's
     /// upper bound is within tolerance.
     case promotable(disagreement: ProportionInterval)
@@ -83,13 +98,17 @@ public enum PromotionVerdict: Sendable, Hashable {
 ///
 /// Also counts evaluations where the observer was requested but unavailable,
 /// because a model that is missing 30% of the time is not promotable however
-/// well it agrees when present.
+/// well it agrees when present — `verdict(_:)` gates on that share before it
+/// looks at agreement. Evaluations where the *driver* was missing (and the
+/// other model drove instead) are counted separately; they say nothing about
+/// the observer.
 public struct ShadowLedger: Sendable, Hashable {
     public private(set) var comparisons = 0
     public private(set) var agreements = 0
     public private(set) var escalations = 0
     public private(set) var relaxations = 0
     public private(set) var observerUnavailable = 0
+    public private(set) var driverUnavailable = 0
 
     public init() {}
 
@@ -108,12 +127,27 @@ public struct ShadowLedger: Sendable, Hashable {
         observerUnavailable = saturatingAdd(observerUnavailable, 1)
     }
 
-    public var disagreements: Int { escalations + relaxations }
+    public mutating func recordDriverUnavailable() {
+        driverUnavailable = saturatingAdd(driverUnavailable, 1)
+    }
+
+    /// Share of observer-requested evaluations in which the observer was
+    /// missing. `nil` when nothing has been requested yet.
+    public var observerAbsenceRate: Double? {
+        let requested = saturatingAdd(comparisons, observerUnavailable)
+        guard requested > 0 else { return nil }
+        return Double(observerUnavailable) / Double(requested)
+    }
+
+    public var disagreements: Int { saturatingAdd(escalations, relaxations) }
 
     public func verdict(_ configuration: ShadowConfiguration) -> PromotionVerdict {
         guard comparisons >= configuration.minimumSamples,
               let interval = wilsonInterval(successes: disagreements, trials: comparisons) else {
             return .insufficientSamples(have: comparisons, need: configuration.minimumSamples)
+        }
+        if let rate = observerAbsenceRate, rate > configuration.maximumObserverAbsence {
+            return .observerTooOftenMissing(rate: rate, limit: configuration.maximumObserverAbsence)
         }
         if interval.upper <= configuration.disagreementTolerance {
             return .promotable(disagreement: interval)

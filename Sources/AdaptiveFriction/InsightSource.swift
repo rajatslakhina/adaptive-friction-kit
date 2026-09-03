@@ -61,8 +61,11 @@ public enum ConsumptionOutcome: Sendable, Hashable, Codable {
     /// The decision was driven by the signal and the operation proceeded
     /// without added friction.
     case proceeded
-    /// The evaluation was requested only to observe (shadow) and did not drive
-    /// the decision.
+    /// The evaluation was requested only to observe and did not drive a
+    /// decision. `RiskPolicy` never produces this: one evaluation id covers
+    /// both model versions and the driver always consumes it. It exists for
+    /// callers that talk to an `InsightSource` directly — a telemetry pass
+    /// that evaluates without acting still owes the platform a report.
     case usedEvaluationOnly
     /// The evaluation went out of scope without the app reporting what it did.
     /// `InsightEvaluation.deinit` sends this so the platform is never left
