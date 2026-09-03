@@ -6,7 +6,7 @@ iOS 27's Trust Insights framework ships an on-device ML signal for exactly that 
 
 This package is the missing middle layer between that signal and a sensitive flow: a `RiskPolicy` actor that fuses the platform's coaching signal with the app's own risk score into a typed friction ladder, fails open to the app's existing controls on every "no signal" state, enforces the consumption contract with the type system, shadow-evaluates the prior model against the current one with a promotion verdict that knows how small its sample is, emits a PII-free audit record for offline fraud labelling, and exposes all nine QA states from an Xcode scheme.
 
-- Demo app: (added after the companion repo is pushed — see below)
+- Demo app: [`adaptive-friction-kit-demo-app`](https://github.com/rajatslakhina/adaptive-friction-kit-demo-app) — a separate Xcode project that consumes this package as a version-pinned remote dependency.
 - Two modules: `AdaptiveFriction` (the policy; no UI, builds on Linux) and `AdaptiveFrictionUI` (a SwiftUI payment-review screen; compiled by the iOS Simulator CI job only).
 
 ## Why this matters
@@ -17,7 +17,7 @@ Every fintech, marketplace and account-recovery flow on iOS is about to have thi
 2. **The signal has a latency and the review screen has a user on it.** A multi-second evaluator cannot hold a "Confirm" button hostage. Every evaluation runs under a hard deadline and a miss fails open to the app's floor — with the basis recorded, so a fail-open decision is never mistaken for a "no evidence" one.
 3. **The consumption report is a contract, not a courtesy.** The platform rate-limits apps that forget it. Here the obligation is a noncopyable value: it cannot be duplicated, `report` consumes it, and if a code path drops it, `deinit` sends `.discardedUnreported` so the platform is never left waiting *and* the ledger counts the defect.
 4. **A new model version is a change to your policy that you did not make.** Two versions come back per call. Exactly one drives; the other is observed; every decision pair is diffed into a ledger whose promotion verdict uses a Wilson interval — and refuses to call zero disagreements in 30 samples "evidence of ≤ 5%", because it is not (the upper bound is 11.4%).
-5. **The audit record is the feedback loop and the privacy surface at once.** Offline fraud labels need a join key; regulators need no PII in the log. The record carries a one-way digest of the operation id and the *names* of the risk signals — never the amount, payee, account or user.
+5. **The audit record is the feedback loop and the privacy surface at once.** Offline fraud labels need a join key; regulators need no PII in the log. The record carries a one-way digest of the operation id, the category, the band, the level and the basis — never the amount, payee, account or user.
 
 ## What's in it
 
@@ -83,7 +83,7 @@ The platform rate-limits apps with unreported evaluations. `RiskPolicy` reserves
 
 ### Shadow evaluation with a verdict that knows how small it is
 
-`ShadowConfiguration` names a *driver* and an *observer* (`.current`/`.prior`, must differ). Both are pushed through the same matrix and the same band, so any difference is attributable to the model, not the policy. `ShadowLedger` counts agreements, escalations (observer would apply more friction) and relaxations (less), plus evaluations where the observer was requested but missing — a model that is absent 30% of the time is not promotable however well it agrees when present.
+`ShadowConfiguration` names a *driver* and an *observer* (`.current`/`.prior`, must differ). Both are pushed through the same matrix and the same band, so any difference is attributable to the model, not the policy. `ShadowLedger` counts agreements, escalations (observer would apply more friction) and relaxations (less), plus evaluations where the observer was requested but missing — and the verdict gates on that share first: an observer absent more than `maximumObserverAbsence` (default 10%) of the time is `observerTooOftenMissing` however well it agrees when present, because a model that cannot answer cannot drive. Evaluations where the *driver* was missing (and the other model drove, with the basis saying so) are counted separately and do not count against the observer.
 
 The verdict is `promotable` only when the 95% Wilson upper bound on the disagreement rate is within tolerance. The default minimum sample count is *derived* from the tolerance — `ceil(z²(1−t)/t)`, which is 73 at 5% — because a round number like 30 sits in a band where zero disagreements can only ever be `blocked` (0/30 has an upper bound of 11.4%). A test pins both facts.
 
@@ -91,7 +91,7 @@ If the configured driver is unavailable on a given call, the other model drives 
 
 *Rejected alternative:* the normal-approximation interval. At n = 30 and p̂ = 0 it has width zero and would call the model promotable after one afternoon of QA.
 
-### Audit records carry a digest and the names of signals — nothing else
+### Audit records carry a digest, the band, the level and the basis — nothing else
 
 `AuditRecord` has nine fields and a test enumerates all of them by `Mirror`, so adding an `amount` is a visible test change. The operation id is an FNV-1a 64 digest (stable across processes, unlike `Hasher`; not cryptographic — the README says a keyed hash belongs here in production). `InMemoryAuditSink` is bounded FIFO; a real app supplies its own `AuditSink`.
 
@@ -161,4 +161,10 @@ swift test
 
 ## Verification
 
-(filled in after CI has reported — see the companion demo repo for the Simulator run status)
+What was actually done, stated separately so none of it can be mistaken for the others:
+
+- **Library, Linux, Swift 6.0.3, clean tree** (`rm -rf .build` first): `swift build -Xswiftc -warnings-as-errors`, `swift build --build-tests -Xswiftc -warnings-as-errors`, `swift test` → **51 tests, 0 failures**. The suite includes the negative controls: a matrix that lets a signal lower friction is rejected; a consumer that drops an `InsightEvaluation` produces exactly one `.discardedUnreported` report that reaches both the ledger and the source; `unreportedIDs` shows a debt until it is paid; 0/30 is `blocked`; five concurrent calls against a cap of two shed exactly three.
+- **CI** ([Actions](https://github.com/rajatslakhina/adaptive-friction-kit/actions)): two jobs on every push to `main` — the Linux job above, and `xcodebuild build -scheme AdaptiveFrictionUI -destination 'generic/platform=iOS Simulator'` on `macos-15`, which is the only place the SwiftUI module is compiled for real (on Linux it is an empty target under `#if canImport(SwiftUI)`).
+- **Demo app compiles for the iOS Simulator** — the companion repo's [CI](https://github.com/rajatslakhina/adaptive-friction-kit-demo-app/actions) resolved this package from GitHub (`XCRemoteSwiftPackageReference`, `upToNextMajorVersion` from 1.0.0) and ran `xcodebuild build -scheme Demo -destination 'generic/platform=iOS Simulator'` to completion; its "Show resolved version" step prints the exact tag each run picked up.
+- **Demo app was NOT run on a Simulator by the run that produced this repository.** Computer-use access to Xcode and the Simulator was requested three times (the third time for the Simulator alone) and refused each time with "can't be approved during a scheduled run". No screenshots exist; the demo repo has no `Demo/Screenshots/` directory and says so.
+- **The real Trust Insights adapter is not compiled here** (see "Wiring the real evaluator"). Every claim in this README about the framework's behaviour is taken from the WWDC26 session and the iOS 27 beta release notes, not from running against the SDK.
